@@ -15,11 +15,12 @@ use common_util::{
 };
 use log::{error, info};
 use logger::RuntimeLevel;
+#[cfg(unix)]
 use profile::Profiler;
 use prom_remote_api::web;
 use proxy::{
     context::RequestContext,
-    handlers::{self},
+    handlers,
     http::sql::{convert_output, Request},
     influxdb::types::{InfluxqlParams, InfluxqlRequest, WriteParams, WriteRequest},
     instance::InstanceRef,
@@ -35,7 +36,7 @@ use warp::{
     header,
     http::StatusCode,
     reject,
-    reply::{self, Reply},
+    reply,
     Filter,
 };
 
@@ -70,6 +71,7 @@ pub enum Error {
     #[snafu(display("Missing proxy.\nBacktrace:\n{}", backtrace))]
     MissingProxy { backtrace: Backtrace },
 
+    #[cfg(unix)]
     #[snafu(display(
         "Fail to do heap profiling, err:{}.\nBacktrace:\n{}",
         source,
@@ -122,6 +124,7 @@ pub struct Service<Q> {
     proxy: Arc<Proxy<Q>>,
     engine_runtimes: Arc<EngineRuntimes>,
     log_runtime: Arc<RuntimeLevel>,
+    #[cfg(unix)]
     profiler: Arc<Profiler>,
     tx: Sender<()>,
     rx: Option<Receiver<()>>,
@@ -394,9 +397,12 @@ impl<Q: QueryExecutor + 'static> Service<Q> {
     }
 
     // GET /debug/heap_profile/{seconds}
+    #[cfg(unix)]
     fn heap_profile(
         &self,
     ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
+        use warp::reply::Reply;
+
         warp::path!("debug" / "heap_profile" / ..)
             .and(warp::path::param::<u64>())
             .and(warp::get())
@@ -415,6 +421,20 @@ impl<Q: QueryExecutor + 'static> Service<Q> {
                     }
                 },
             )
+    }
+
+    // Fallback filter when profiler features is not enabled
+    // GET /debug/heap_profile/{seconds}
+    #[cfg(not(unix))]
+    fn heap_profile(
+        &self,
+    ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
+        warp::path!("debug" / "heap_profile" / ..)
+            .and(warp::path::param::<u64>())
+            .and(warp::get())
+            .then(|_param| async {
+                reply::with_status("Memory profiler not available", StatusCode::NOT_FOUND) 
+            })
     }
 
     // GET /debug/cpu_profile/{seconds}
@@ -564,6 +584,7 @@ impl<Q: QueryExecutor + 'static> Service<Q> {
             )
     }
 
+    #[cfg(unix)]
     fn with_profiler(&self) -> impl Filter<Extract = (Arc<Profiler>,), Error = Infallible> + Clone {
         let profiler = self.profiler.clone();
         warp::any().map(move || profiler.clone())
@@ -657,6 +678,7 @@ impl<Q: QueryExecutor + 'static> Builder<Q> {
             proxy,
             engine_runtimes,
             log_runtime,
+            #[cfg(unix)]
             profiler: Arc::new(Profiler::default()),
             tx,
             rx: Some(rx),
@@ -684,6 +706,7 @@ struct ErrorResponse {
 }
 
 fn error_to_status_code(err: &Error) -> StatusCode {
+    #[cfg(unix)]
     match err {
         Error::CreateContext { .. } => StatusCode::BAD_REQUEST,
         // TODO(yingwen): Map handle request error to more accurate status code
@@ -695,6 +718,24 @@ fn error_to_status_code(err: &Error) -> StatusCode {
         | Error::MissingProxy { .. }
         | Error::ParseIpAddr { .. }
         | Error::ProfileHeap { .. }
+        | Error::Internal { .. }
+        | Error::JoinAsyncTask { .. }
+        | Error::AlreadyStarted { .. }
+        | Error::MissingRouter { .. }
+        | Error::MissingWal { .. }
+        | Error::HandleUpdateLogLevel { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+    #[cfg(not(unix))]
+    match err {
+        Error::CreateContext { .. } => StatusCode::BAD_REQUEST,
+        // TODO(yingwen): Map handle request error to more accurate status code
+        Error::HandleRequest { .. }
+        | Error::MissingEngineRuntimes { .. }
+        | Error::MissingLogRuntime { .. }
+        | Error::MissingInstance { .. }
+        | Error::MissingSchemaConfigProvider { .. }
+        | Error::MissingProxy { .. }
+        | Error::ParseIpAddr { .. }
         | Error::Internal { .. }
         | Error::JoinAsyncTask { .. }
         | Error::AlreadyStarted { .. }
